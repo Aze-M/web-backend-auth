@@ -110,5 +110,5 @@ fn register(json: Json<Value>) -> Json<Token> {
 
 #[launch]
 fn rocket() -> _ {
-    rocket::build().mount("/", routes![login, logout, register])
+    rocket::build().mount("/", routes![login, logout, register]).attach(CORS)
 }
