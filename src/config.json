@@ -1,5 +1,0 @@
-{
-    "port": 3001,
-    "database": "mariadb://apiuser:Xo25pahI@127.0.0.1/com.aze-m.api",
-	"arbstring": "hYdN"
-}
