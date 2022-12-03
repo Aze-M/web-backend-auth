@@ -1,7 +1,12 @@
 #[macro_use]
 extern crate rocket;
 
-use rocket::http::{ContentType, Header, Status};
+use std::fs::File;
+use std::io::{Read, BufReader};
+use std::path::Path;
+use std::str::FromStr;
+
+use rocket::http::{Header, Status};
 use rocket::{Request, Response};
 
 use rand::distributions::Alphanumeric;
@@ -11,10 +16,8 @@ use rocket::fairing::{Fairing, Info, Kind};
 use rocket::serde::json::Json;
 use rocket::serde::json::*;
 use rocket::serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::*;
-
-//Constants
-const ARB_STRING: &str = "hYdN";
 
 //Manual CORS implementation
 pub struct CORS;
@@ -48,6 +51,13 @@ struct Account {
 struct Token {
     id: i128,
     token: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct Options {
+    port: i128,
+    database: String,
+    arbstring: String
 }
 
 struct AccFetchSettings {
@@ -87,9 +97,42 @@ fn find_account(search: AccFetchSettings) -> Option<Account> {
     });
 }
 
+fn load_config() -> Option<Options> {
+    //Path to config
+    let path: &Path = Path::new("./config/config.json");
+    let display = path.display();
+    let file = File::open(path);
+
+    //None if the file fails to load, log to console.
+    if !file.is_ok() {
+        println!("Could not load file {:?}", display);
+        println!("Work dir {:?}", std::env::current_dir());
+        return None;
+    }
+
+    //parse file into usable struct
+    let mut config = file.unwrap();
+    let mut config_buffer = String::new();
+    config.read_to_string(&mut config_buffer).unwrap();
+
+    let conf_js: Options = serde_json::from_str(&config_buffer).unwrap();
+
+    Some(conf_js)
+}
+
 //Handling logins
 #[post("/auth/login", format = "json", data = "<json>")]
 fn login(json: Json<Value>) -> Result<Json<Token>, Status> {
+    //load config
+    let config = load_config();
+
+    //error if the config fails to load
+    if config.is_none() {
+        return Err(Status::InternalServerError);
+    }
+
+    println!("{:?}", config);
+
     //define request and reserve for token
     let incoming_request = json.as_object().unwrap();
     let user_token: Token;
@@ -100,8 +143,9 @@ fn login(json: Json<Value>) -> Result<Json<Token>, Status> {
     }
 
     //on good requests, move name and password to variables for ease
-    let name = incoming_request.get("name").unwrap().to_string();
-    let mut pwd = incoming_request.get("password").unwrap().to_string() + ARB_STRING;
+    let name = incoming_request.get("name").unwrap().as_str().unwrap();
+    let mut pwd: String = format!("{}{}",incoming_request.get("password").unwrap().as_str().unwrap(), &config.unwrap().arbstring);
+    println!("{}", pwd);
 
     //encrypt password
     let mut crypt = Sha512::new();
@@ -111,7 +155,7 @@ fn login(json: Json<Value>) -> Result<Json<Token>, Status> {
     //find the accound
     let acc = find_account(AccFetchSettings {
         id: None,
-        name: Some(name),
+        name: Some(name.into()),
         password: Some(pwd.into()),
     });
 
@@ -120,7 +164,7 @@ fn login(json: Json<Value>) -> Result<Json<Token>, Status> {
         return Err(Status::BadRequest);
     }
 
-    //Generate a new token for
+    //Generate a new token for acc
     user_token = generate_token(acc.unwrap());
 
     Ok(Json::from(user_token))
