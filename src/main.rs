@@ -1,22 +1,32 @@
+//TODO:
+//finish login system to insert tokens
+//start logout to delete all tokens for account
+//start register with account checks.
+
 #[macro_use]
 extern crate rocket;
 
+use std::fmt::format;
 use std::fs::File;
-use std::io::{Read, BufReader};
+use std::io::Read;
 use std::path::Path;
-use std::str::FromStr;
+use std::vec;
 
-use rocket::http::{Header, Status};
-use rocket::{Request, Response};
+use mysql::prelude::Queryable;
+use mysql::{from_row, Row};
+use mysql::{Conn, Opts, Pool};
 
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 
 use rocket::fairing::{Fairing, Info, Kind};
+use rocket::http::uri::Query;
+use rocket::http::{Header, Status};
 use rocket::serde::json::Json;
 use rocket::serde::json::*;
 use rocket::serde::{Deserialize, Serialize};
-use serde_json::json;
+use rocket::{Request, Response};
+
 use sha2::*;
 
 //Manual CORS implementation
@@ -44,7 +54,8 @@ impl Fairing for CORS {
 struct Account {
     id: i128,
     name: String,
-    password: &'static str,
+    password: String,
+    gravatar: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -57,17 +68,17 @@ struct Token {
 struct Options {
     port: i128,
     database: String,
-    arbstring: String
+    arbstring: String,
 }
 
 struct AccFetchSettings {
     id: Option<i128>,
-    name: Option<String>,
+    username: Option<String>,
     password: Option<String>,
 }
 
 //general Functions
-fn generate_token(acc: Account) -> Token {
+fn generate_token(acc: Account, pool: &Pool) -> Option<Token> {
     //Make a random token
     let mut crypt = Sha512::new();
     let rand_string: String = thread_rng()
@@ -82,19 +93,91 @@ fn generate_token(acc: Account) -> Token {
         token: format!("{:x}", crypt.finalize()),
     };
 
-    return user_token;
+    //insert generated token in to db, remove old tokens for account id.
+    let conn = pool.get_conn();
+
+    if conn.is_ok() {
+        let del_query = format!("DELETE FROM sessions WHERE userid = '{}'", user_token.id);
+        let ins_query = format!(
+            "INSERT INTO sessions (userid, token) VALUES ('{}','{}') ",
+            &user_token.id, user_token.token
+        );
+        let mut conn = conn.unwrap();
+        let del = conn.query::<Row, &str>(&del_query);
+        let ins = conn.query::<Row, &str>(&ins_query);
+        
+        if ins.is_err() || del.is_err() {
+            return None;
+        }
+
+    } else {
+        return None;
+    }
+
+    return Some(user_token);
 }
 
-fn validate_token(tok: Token) -> bool {
-    true
+fn validate_token(tok: &Token, pool: &Pool) -> bool {
+    let query = format!("SELECT * FROM sessions WHERE token = '{}'", tok.token);
+    let conn = pool.get_conn();
+
+    if conn.is_ok() {
+        let res = conn.unwrap().query::<Row, &str>(&query);
+
+        println!("{:?}",res);
+
+        if res.is_err() {
+            return false;
+        }
+
+        let res = res.unwrap();
+
+        if res.len() == 0 {
+            return false;
+        }
+
+        return true;
+    }
+
+    return false;
 }
 
-fn find_account(search: AccFetchSettings) -> Option<Account> {
-    return Some(Account {
-        id: 420,
-        name: "Aze".into(),
-        password: "wow".into(),
-    });
+fn find_account(search: AccFetchSettings, pool: &Pool) -> Option<Account> {
+    //define used vars in outer scope
+    let mut options: Vec<String> = Vec::new();
+    let mut acc: Account;
+
+    //add used search parameters
+    if search.id.is_some() {
+        options.push(format!("id = '{}'", search.id.unwrap()));
+    }
+
+    if search.username.is_some() {
+        options.push(format!("username = '{}'", search.username.unwrap()));
+    }
+
+    if search.password.is_some() {
+        options.push(format!("password = '{}'", search.password.unwrap()));
+    }
+
+    let query = format!("SELECT * FROM accounts WHERE {} ", options.join(" AND "));
+
+    let mut conn = pool.get_conn().unwrap();
+
+    for row in conn.query::<Row, &str>(&query).unwrap() {
+        let data = from_row::<Row>(row.clone());
+
+        acc = Account {
+            id: data.get(0).unwrap(),
+            name: data.get(1).unwrap(),
+            password: data.get(2).unwrap(),
+            gravatar: data.get(3).unwrap(),
+        };
+
+        return Some(acc);
+    }
+
+    return None;
 }
 
 fn load_config() -> Option<Options> {
@@ -131,21 +214,37 @@ fn login(json: Json<Value>) -> Result<Json<Token>, Status> {
         return Err(Status::InternalServerError);
     }
 
-    println!("{:?}", config);
+    let conf_unw = config.unwrap();
+
+    //get used vars out of config
+    let arb = String::from(conf_unw.arbstring);
+    let db = Opts::from_url(&conf_unw.database);
+
+    //create connection pool to pass onto lower functions
+    let pool;
+
+    if db.is_ok() {
+        pool = Pool::new(db.unwrap()).unwrap();
+    } else {
+        return Err(Status::InternalServerError);
+    }
 
     //define request and reserve for token
     let incoming_request = json.as_object().unwrap();
-    let user_token: Token;
+    let user_token: Option<Token>;
 
     //decline bad requests
     if !incoming_request.contains_key("name") || !incoming_request.contains_key("password") {
         return Err(Status::BadRequest);
     }
 
-    //on good requests, move name and password to variables for ease
+    //on good requests, move name and password to variables for ease of use, add arbitration to password
     let name = incoming_request.get("name").unwrap().as_str().unwrap();
-    let mut pwd: String = format!("{}{}",incoming_request.get("password").unwrap().as_str().unwrap(), &config.unwrap().arbstring);
-    println!("{}", pwd);
+    let mut pwd: String = format!(
+        "{}{}",
+        incoming_request.get("password").unwrap().as_str().unwrap(),
+        arb
+    );
 
     //encrypt password
     let mut crypt = Sha512::new();
@@ -153,11 +252,14 @@ fn login(json: Json<Value>) -> Result<Json<Token>, Status> {
     pwd = format!("{:x}", crypt.finalize());
 
     //find the accound
-    let acc = find_account(AccFetchSettings {
-        id: None,
-        name: Some(name.into()),
-        password: Some(pwd.into()),
-    });
+    let acc = find_account(
+        AccFetchSettings {
+            id: None,
+            username: Some(name.into()),
+            password: Some(pwd.into()),
+        },
+        &pool,
+    );
 
     //if it does not exist return badrequest
     if !acc.is_some() {
@@ -165,9 +267,19 @@ fn login(json: Json<Value>) -> Result<Json<Token>, Status> {
     }
 
     //Generate a new token for acc
-    user_token = generate_token(acc.unwrap());
+    user_token = generate_token(acc.unwrap(), &pool);
 
-    Ok(Json::from(user_token))
+    if user_token.is_none() {
+        return Err(Status::InternalServerError);
+    }
+
+    let user_token = user_token.unwrap();
+
+    if validate_token(&user_token, &pool) {
+        return Ok(Json::from(user_token));
+    }
+
+    return Err(Status::BadRequest);
 }
 
 //Handling logouts
