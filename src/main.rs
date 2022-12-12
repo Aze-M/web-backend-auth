@@ -1,31 +1,30 @@
 //TODO:
-//finish login system to insert tokens
+
 //start logout to delete all tokens for account
 //start register with account checks.
 
 #[macro_use]
 extern crate rocket;
 
-use std::fmt::format;
 use std::fs::File;
 use std::io::Read;
+use std::net::Ipv4Addr;
 use std::path::Path;
 use std::vec;
 
 use mysql::prelude::Queryable;
 use mysql::{from_row, Row};
-use mysql::{Conn, Opts, Pool};
+use mysql::{Opts, Pool};
 
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 
 use rocket::fairing::{Fairing, Info, Kind};
-use rocket::http::uri::Query;
 use rocket::http::{Header, Status};
 use rocket::serde::json::Json;
 use rocket::serde::json::*;
 use rocket::serde::{Deserialize, Serialize};
-use rocket::{Request, Response};
+use rocket::{Config, Request, Response};
 
 use sha2::*;
 
@@ -66,7 +65,7 @@ struct Token {
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Options {
-    port: i128,
+    port: u16,
     database: String,
     arbstring: String,
 }
@@ -75,9 +74,29 @@ struct AccFetchSettings {
     id: Option<i128>,
     username: Option<String>,
     password: Option<String>,
+    token: Option<String>,
 }
 
 //general Functions
+fn purge_tokens(acc: Account, pool: &Pool) -> bool {
+    let conn = pool.get_conn();
+
+    if conn.is_ok() {
+        let del_query = format!("DELETE FROM sessions WHERE userid = '{}'", acc.id);
+
+        let mut conn = conn.unwrap();
+        let del = conn.query::<Row, &str>(&del_query);
+
+        if del.is_err() {
+            return false;
+        }
+
+        return true;
+    } else {
+        return false;
+    }
+}
+
 fn generate_token(acc: Account, pool: &Pool) -> Option<Token> {
     //Make a random token
     let mut crypt = Sha512::new();
@@ -96,20 +115,23 @@ fn generate_token(acc: Account, pool: &Pool) -> Option<Token> {
     //insert generated token in to db, remove old tokens for account id.
     let conn = pool.get_conn();
 
+    if !purge_tokens(acc, pool) {
+        return None;
+    };
+
     if conn.is_ok() {
-        let del_query = format!("DELETE FROM sessions WHERE userid = '{}'", user_token.id);
+        //build query to insert token into db
         let ins_query = format!(
             "INSERT INTO sessions (userid, token) VALUES ('{}','{}') ",
             &user_token.id, user_token.token
         );
         let mut conn = conn.unwrap();
-        let del = conn.query::<Row, &str>(&del_query);
         let ins = conn.query::<Row, &str>(&ins_query);
-        
-        if ins.is_err() || del.is_err() {
+
+        //if it errors return none to trigger error catch
+        if ins.is_err() {
             return None;
         }
-
     } else {
         return None;
     }
@@ -124,7 +146,7 @@ fn validate_token(tok: &Token, pool: &Pool) -> bool {
     if conn.is_ok() {
         let res = conn.unwrap().query::<Row, &str>(&query);
 
-        println!("{:?}",res);
+        println!("{:?}", res);
 
         if res.is_err() {
             return false;
@@ -145,7 +167,7 @@ fn validate_token(tok: &Token, pool: &Pool) -> bool {
 fn find_account(search: AccFetchSettings, pool: &Pool) -> Option<Account> {
     //define used vars in outer scope
     let mut options: Vec<String> = Vec::new();
-    let mut acc: Account;
+    let acc: Account;
 
     //add used search parameters
     if search.id.is_some() {
@@ -180,6 +202,59 @@ fn find_account(search: AccFetchSettings, pool: &Pool) -> Option<Account> {
     return None;
 }
 
+fn find_account_id_from_token(search: AccFetchSettings, pool: &Pool) -> Option<i128> {
+    if search.token.is_none() {
+        return None;
+    }
+
+    let query = format!(
+        "SELECT userid FROM sessions WHERE token = '{}'",
+        search.token.unwrap().as_str()
+    );
+
+    let mut conn = pool.get_conn().unwrap();
+
+    for row in conn.query::<Row, &str>(&query).unwrap() {
+        let data = from_row::<Row>(row.clone());
+
+        println!("{:?}", data);
+
+        return Some(data.get(0).unwrap());
+    }
+
+    return None;
+}
+
+fn insert_account(name: String, pwd: String, gravatar: String, pool: &Pool) -> Option<Account> {
+    let query = format!(
+        "INSERT INTO accounts (username,password,gravatar) VALUES ('{}','{}','{}')",
+        name, pwd, gravatar
+    );
+
+    let mut conn = pool.get_conn().unwrap();
+
+    for row in conn.query::<Row, &str>(&query).unwrap() {
+        let data = from_row::<Row>(row.clone());
+
+        println!("{:?}", data);
+    }
+
+    let search = AccFetchSettings {
+        id: None,
+        username: Some(name),
+        password: Some(pwd),
+        token: None
+    };
+
+    let acc = find_account(search, pool);
+
+    if acc.is_some() {
+        return acc;
+    }
+
+    return None;
+}
+
 fn load_config() -> Option<Options> {
     //Path to config
     let path: &Path = Path::new("./config/config.json");
@@ -206,6 +281,8 @@ fn load_config() -> Option<Options> {
 //Handling logins
 #[post("/auth/login", format = "json", data = "<json>")]
 fn login(json: Json<Value>) -> Result<Json<Token>, Status> {
+    println!("Recieved login request");
+
     //load config
     let config = load_config();
 
@@ -257,6 +334,7 @@ fn login(json: Json<Value>) -> Result<Json<Token>, Status> {
             id: None,
             username: Some(name.into()),
             password: Some(pwd.into()),
+            token: None,
         },
         &pool,
     );
@@ -284,31 +362,169 @@ fn login(json: Json<Value>) -> Result<Json<Token>, Status> {
 
 //Handling logouts
 #[post("/auth/logout", format = "json", data = "<json>")]
-fn logout(json: Json<Value>) -> Json<Token> {
+fn logout(json: Json<Value>) -> Status {
+    println!("Recieved logout request");
+
+    //load config
+    let config = load_config();
+
+    //error if the config fails to load
+    if config.is_none() {
+        return Status::InternalServerError;
+    }
+
+    let conf_unw = config.unwrap();
+
+    //get used vars out of config
+    let db = Opts::from_url(&conf_unw.database);
+
+    //create connection pool to pass onto lower functions
+    let pool;
+
+    if db.is_ok() {
+        pool = Pool::new(db.unwrap()).unwrap();
+    } else {
+        return Status::InternalServerError;
+    }
+
     let incoming_request = json.as_object().unwrap();
-    let user_token = Token {
-        id: 1,
-        token: "aassdd".into(),
+
+    let mut search = AccFetchSettings {
+        id: None,
+        username: None,
+        password: None,
+        token: Some(
+            incoming_request
+                .get("token")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .into(),
+        ),
     };
 
-    Json::from(user_token)
+    println!("{:?}", search.token);
+
+    let affected_account_id = find_account_id_from_token(search, &pool);
+
+    if affected_account_id.is_none() {
+        return Status::Unauthorized;
+    }
+
+    search = AccFetchSettings {
+        id: affected_account_id,
+        username: None,
+        password: None,
+        token: None,
+    };
+    let affected_account = find_account(search, &pool);
+
+    if affected_account.is_none() {
+        return Status::InternalServerError;
+    }
+
+    purge_tokens(affected_account.unwrap(), &pool);
+
+    return Status::Ok;
 }
 
 //Handling registration
 #[post("/auth/register", format = "json", data = "<json>")]
-fn register(json: Json<Value>) -> Json<Token> {
+fn register(json: Json<Value>) -> Result<Json<Token>, Status> {
+    println!("Recieved register request");
+
+    //load config
+    let config = load_config();
+
+    //error if the config fails to load
+    if config.is_none() {
+        return Err(Status::InternalServerError);
+    }
+
+    let conf_unw = config.unwrap();
+
+    //get used vars out of config
+    let db = Opts::from_url(&conf_unw.database);
+    let arb = conf_unw.arbstring;
+
+    //create connection pool to pass onto lower functions
+    let pool;
+
+    if db.is_ok() {
+        pool = Pool::new(db.unwrap()).unwrap();
+    } else {
+        return Err(Status::InternalServerError);
+    }
+
     let incoming_request = json.as_object().unwrap();
-    let user_token = Token {
-        id: 1,
-        token: "aassdd".into(),
+
+    if incoming_request.get("username").is_none() || incoming_request.get("password").is_none() {
+        return Err(Status::BadRequest);
+    }
+
+    //redefine for ease of use
+    let name = incoming_request.get("username").unwrap().as_str().unwrap();
+    let mut pwd: String = format!(
+        "{}{}",
+        incoming_request.get("password").unwrap().as_str().unwrap(),
+        arb
+    );
+    let gravatar = incoming_request.get("gravatar").unwrap().as_str().unwrap();
+
+    //crypt password
+    let mut crypt = Sha512::new();
+    crypt.update(pwd);
+    pwd = format!("{:x}", crypt.finalize());
+
+    let search = AccFetchSettings {
+        id: None,
+        username: Some(name.into()),
+        password: None,
+        token: None,
     };
 
-    Json::from(user_token)
+    let account_check = find_account(search, &pool);
+
+    if account_check.is_some() {
+        return Err(Status::BadRequest);
+    }
+
+    let acc = insert_account(name.into(), pwd, gravatar.into(), &pool);
+
+    if acc.is_none() {
+        return Err(Status::InternalServerError);
+    }
+    
+    let acc = acc.unwrap();
+
+    let initial_token = generate_token(acc, &pool);
+
+    if initial_token.is_none() {
+        return Err(Status::InternalServerError);
+    }
+
+    return Ok(Json::from(initial_token.unwrap()));
 }
 
 #[launch]
 fn rocket() -> _ {
-    rocket::build()
+    let conf_file = load_config();
+
+    if conf_file.is_none() {
+        panic!("Could not load config!");
+    }
+
+    let conf_file = conf_file.unwrap();
+
+    let conf = Config {
+        port: conf_file.port,
+        address: std::net::IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+        ..Config::default()
+    };
+
+    println!("Started @ {} : {}", conf.address, conf.port);
+
+    rocket::custom(&conf)
         .mount("/", routes![login, logout, register])
         .attach(CORS)
 }
