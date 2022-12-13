@@ -243,7 +243,7 @@ fn insert_account(name: String, pwd: String, gravatar: String, pool: &Pool) -> O
         id: None,
         username: Some(name),
         password: Some(pwd),
-        token: None
+        token: None,
     };
 
     let acc = find_account(search, pool);
@@ -494,7 +494,7 @@ fn register(json: Json<Value>) -> Result<Json<Token>, Status> {
     if acc.is_none() {
         return Err(Status::InternalServerError);
     }
-    
+
     let acc = acc.unwrap();
 
     let initial_token = generate_token(acc, &pool);
@@ -504,6 +504,70 @@ fn register(json: Json<Value>) -> Result<Json<Token>, Status> {
     }
 
     return Ok(Json::from(initial_token.unwrap()));
+}
+
+#[post("/auth/getinfo", format = "json", data = "<json>")]
+fn getinfo(json: Json<Value>) -> Result<Json<Account>, Status> {
+    println!("Recieved register request");
+
+    //load config
+    let config = load_config();
+
+    //error if the config fails to load
+    if config.is_none() {
+        return Err(Status::InternalServerError);
+    }
+
+    let conf_unw = config.unwrap();
+
+    //get used vars out of config
+    let db = Opts::from_url(&conf_unw.database);
+
+    //define connection pool if db string can be parsed
+    let pool;
+
+    if db.is_ok() {
+        pool = Pool::new(db.unwrap()).unwrap();
+    } else {
+        return Err(Status::InternalServerError);
+    }
+
+    let incoming_request = json.as_object().unwrap();
+
+    let mut search = AccFetchSettings {
+        id: None,
+        username: None,
+        password: None,
+        token: Some(
+            incoming_request
+                .get("token")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .into(),
+        ),
+    };
+
+    let id = find_account_id_from_token(search, &pool);
+
+    if id.is_none() {
+        return Err(Status::BadRequest);
+    }
+
+    search = AccFetchSettings {
+        id: id,
+        username: None,
+        password: None,
+        token: None,
+    };
+
+    let acc = find_account(search, &pool);
+
+    if acc.is_none() {
+        return Err(Status::InternalServerError);
+    }
+
+    return Ok(Json::from(acc.unwrap()));
 }
 
 #[launch]
