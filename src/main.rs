@@ -13,7 +13,7 @@ use std::path::Path;
 use std::vec;
 
 use mysql::prelude::Queryable;
-use mysql::{from_row, Row};
+use mysql::{from_row, params, Row, Statement};
 use mysql::{Opts, Pool};
 
 use rand::distributions::Alphanumeric;
@@ -59,7 +59,7 @@ struct Account {
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Token {
-    id: i128,
+    id: Option<i128>,
     token: String,
 }
 
@@ -77,24 +77,58 @@ struct AccFetchSettings {
     token: Option<String>,
 }
 
+// impl<'a, 'r> FromRequest<'a, 'r> for Token {
+//     type Error = Infallible;
+
+//     fn from_request(request: &'a Request<'r>) -> Outcome<Self, Self::Error> {
+//         let token = request.headers().get_one("Authorization");
+//     }
+// }
+
+//Config
+fn load_config() -> Option<Options> {
+    //Path to config
+    let path: &Path = Path::new("./config/config.json");
+    let display = path.display();
+    let file = File::open(path);
+
+    //None if the file fails to load, log to console.
+    if !file.is_ok() {
+        println!("Could not load file {:?}", display);
+        println!("Work dir {:?}", std::env::current_dir());
+        return None;
+    }
+
+    //parse file into usable struct
+    let mut config = file.unwrap();
+    let mut config_buffer = String::new();
+    config.read_to_string(&mut config_buffer).unwrap();
+
+    let conf_js: Options = serde_json::from_str(&config_buffer).unwrap();
+
+    Some(conf_js)
+}
+
 //general Functions
 fn purge_tokens(acc: Account, pool: &Pool) -> bool {
     let conn = pool.get_conn();
 
-    if conn.is_ok() {
-        let del_query = format!("DELETE FROM sessions WHERE userid = '{}'", acc.id);
-
-        let mut conn = conn.unwrap();
-        let del = conn.query::<Row, &str>(&del_query);
-
-        if del.is_err() {
-            return false;
-        }
-
-        return true;
-    } else {
+    if conn.is_err() {
         return false;
     }
+    let mut conn = conn.unwrap();
+
+    let query = conn
+        .prep("DELETE FROM sessions WHERE userid = :id")
+        .unwrap();
+
+    let del = conn.exec::<Row, Statement, &str>(&query, params! {"id" => acc.id});
+
+    if del.is_err() {
+        return false;
+    }
+
+    return true;
 }
 
 fn generate_token(acc: Account, pool: &Pool) -> Option<Token> {
@@ -108,7 +142,7 @@ fn generate_token(acc: Account, pool: &Pool) -> Option<Token> {
     crypt.update(rand_string);
 
     let user_token = Token {
-        id: acc.id,
+        id: Some(acc.id),
         token: format!("{:x}", crypt.finalize()),
     };
 
@@ -119,20 +153,23 @@ fn generate_token(acc: Account, pool: &Pool) -> Option<Token> {
         return None;
     };
 
-    if conn.is_ok() {
-        //build query to insert token into db
-        let ins_query = format!(
-            "INSERT INTO sessions (userid, token) VALUES ('{}','{}') ",
-            &user_token.id, user_token.token
-        );
-        let mut conn = conn.unwrap();
-        let ins = conn.query::<Row, &str>(&ins_query);
+    if conn.is_err() {
+        return None;
+    }
+    //build query to insert token into db
+    let mut conn = conn.unwrap();
 
-        //if it errors return none to trigger error catch
-        if ins.is_err() {
-            return None;
-        }
-    } else {
+    let query = conn
+        .prep("INSERT INTO sessions (userid,token) VALUES (:id,:token)")
+        .unwrap();
+
+    let ins = conn.exec::<Row, Statement, &str>(
+        &query,
+        params! {"id" => user_token.id.unwrap(), "token" => user_token.token},
+    );
+
+    //if it errors return none to trigger error catch
+    if ins.is_err() {
         return None;
     }
 
@@ -140,28 +177,28 @@ fn generate_token(acc: Account, pool: &Pool) -> Option<Token> {
 }
 
 fn validate_token(tok: &Token, pool: &Pool) -> bool {
+    //unsafe query is fine since this if only called by token generation.
     let query = format!("SELECT * FROM sessions WHERE token = '{}'", tok.token);
     let conn = pool.get_conn();
 
-    if conn.is_ok() {
-        let res = conn.unwrap().query::<Row, &str>(&query);
+    if conn.is_err() {
+        return false;
+    }
+    let conn = conn.unwrap();
 
-        println!("{:?}", res);
+    let res = conn.query::<Row, &str>(&query);
 
-        if res.is_err() {
-            return false;
-        }
-
-        let res = res.unwrap();
-
-        if res.len() == 0 {
-            return false;
-        }
-
-        return true;
+    if res.is_err() {
+        return false;
     }
 
-    return false;
+    let res = res.unwrap();
+
+    if res.len() == 0 {
+        return false;
+    }
+
+    return true;
 }
 
 fn find_account(search: AccFetchSettings, pool: &Pool) -> Option<Account> {
@@ -182,6 +219,7 @@ fn find_account(search: AccFetchSettings, pool: &Pool) -> Option<Account> {
         options.push(format!("password = '{}'", search.password.unwrap()));
     }
 
+    //unsafe , needs reworking
     let query = format!("SELECT * FROM accounts WHERE {} ", options.join(" AND "));
 
     let mut conn = pool.get_conn().unwrap();
@@ -207,14 +245,16 @@ fn find_account_id_from_token(search: AccFetchSettings, pool: &Pool) -> Option<i
         return None;
     }
 
-    let query = format!(
-        "SELECT userid FROM sessions WHERE token = '{}'",
-        search.token.unwrap().as_str()
-    );
+    let conn = pool.get_conn().unwrap();
 
-    let mut conn = pool.get_conn().unwrap();
+    let query = conn
+        .prep("SELECT userid FROM sessions where token = :token")
+        .unwrap();
 
-    for row in conn.query::<Row, &str>(&query).unwrap() {
+    for row in conn
+        .exec::<Row, Statement, &str>(&query, params! {"token" => search.token.unwrap().as_str()})
+        .unwrap()
+    {
         let data = from_row::<Row>(row.clone());
 
         println!("{:?}", data);
@@ -226,14 +266,11 @@ fn find_account_id_from_token(search: AccFetchSettings, pool: &Pool) -> Option<i
 }
 
 fn insert_account(name: String, pwd: String, gravatar: String, pool: &Pool) -> Option<Account> {
-    let query = format!(
-        "INSERT INTO accounts (username,password,gravatar) VALUES ('{}','{}','{}')",
-        name, pwd, gravatar
-    );
+    let conn = pool.get_conn().unwrap();
 
-    let mut conn = pool.get_conn().unwrap();
+    let query = conn.prep("INSERT INTO accounts (username,password,gravatar) VALUES (:username,:password,:gravatar)").unwrap();
 
-    for row in conn.query::<Row, &str>(&query).unwrap() {
+    for row in conn.exec::<Row, Statement, &str>(&query,params! {"username" => name, "password" => pwd, "gravatar" => gravatar}).unwrap() {
         let data = from_row::<Row>(row.clone());
 
         println!("{:?}", data);
@@ -253,29 +290,6 @@ fn insert_account(name: String, pwd: String, gravatar: String, pool: &Pool) -> O
     }
 
     return None;
-}
-
-fn load_config() -> Option<Options> {
-    //Path to config
-    let path: &Path = Path::new("./config/config.json");
-    let display = path.display();
-    let file = File::open(path);
-
-    //None if the file fails to load, log to console.
-    if !file.is_ok() {
-        println!("Could not load file {:?}", display);
-        println!("Work dir {:?}", std::env::current_dir());
-        return None;
-    }
-
-    //parse file into usable struct
-    let mut config = file.unwrap();
-    let mut config_buffer = String::new();
-    config.read_to_string(&mut config_buffer).unwrap();
-
-    let conf_js: Options = serde_json::from_str(&config_buffer).unwrap();
-
-    Some(conf_js)
 }
 
 //Handling logins
