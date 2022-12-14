@@ -12,8 +12,8 @@ use std::net::Ipv4Addr;
 use std::path::Path;
 use std::vec;
 
-use mysql::prelude::Queryable;
-use mysql::{from_row, params, Row, Statement};
+use mysql::prelude::{Queryable};
+use mysql::{from_row, params, Row};
 use mysql::{Opts, Pool};
 
 use rand::distributions::Alphanumeric;
@@ -118,11 +118,11 @@ fn purge_tokens(acc: Account, pool: &Pool) -> bool {
     }
     let mut conn = conn.unwrap();
 
-    let query = conn
+    let stmt = conn
         .prep("DELETE FROM sessions WHERE userid = :id")
         .unwrap();
 
-    let del = conn.exec::<Row, Statement, &str>(&query, params! {"id" => acc.id});
+    let del: Result<Vec<Row>, mysql::Error> = conn.exec(&stmt, params! { "id" => acc.id });
 
     if del.is_err() {
         return false;
@@ -159,13 +159,13 @@ fn generate_token(acc: Account, pool: &Pool) -> Option<Token> {
     //build query to insert token into db
     let mut conn = conn.unwrap();
 
-    let query = conn
-        .prep("INSERT INTO sessions (userid,token) VALUES (:id,:token)")
+    let stmt = conn
+        .prep("INSERT INTO sessions ( userid , token ) VALUES ( :userid , :token )")
         .unwrap();
 
-    let ins = conn.exec::<Row, Statement, &str>(
-        &query,
-        params! {"id" => user_token.id.unwrap(), "token" => user_token.token},
+    let ins: Result<Vec<Row>, mysql::Error>  = conn.exec(
+        &stmt,
+        params! {"userid" => &user_token.id.unwrap(), "token" => &user_token.token},
     );
 
     //if it errors return none to trigger error catch
@@ -184,9 +184,9 @@ fn validate_token(tok: &Token, pool: &Pool) -> bool {
     if conn.is_err() {
         return false;
     }
-    let conn = conn.unwrap();
+    let mut conn = conn.unwrap();
 
-    let res = conn.query::<Row, &str>(&query);
+    let res: Result<Vec<Row>, mysql::Error>  = conn.query::<Row, &str>(&query);
 
     if res.is_err() {
         return false;
@@ -245,15 +245,17 @@ fn find_account_id_from_token(search: AccFetchSettings, pool: &Pool) -> Option<i
         return None;
     }
 
-    let conn = pool.get_conn().unwrap();
+    let mut conn = pool.get_conn().unwrap();
 
-    let query = conn
+    let stmt = conn
         .prep("SELECT userid FROM sessions where token = :token")
         .unwrap();
 
-    for row in conn
-        .exec::<Row, Statement, &str>(&query, params! {"token" => search.token.unwrap().as_str()})
-        .unwrap()
+    let exec: Result<Vec<Row>, mysql::Error> = conn
+    .exec(&stmt, params! {"token" => search.token.unwrap().as_str()});
+
+
+    for row in exec.unwrap()
     {
         let data = from_row::<Row>(row.clone());
 
@@ -266,11 +268,13 @@ fn find_account_id_from_token(search: AccFetchSettings, pool: &Pool) -> Option<i
 }
 
 fn insert_account(name: String, pwd: String, gravatar: String, pool: &Pool) -> Option<Account> {
-    let conn = pool.get_conn().unwrap();
+    let mut conn = pool.get_conn().unwrap();
 
     let query = conn.prep("INSERT INTO accounts (username,password,gravatar) VALUES (:username,:password,:gravatar)").unwrap();
 
-    for row in conn.exec::<Row, Statement, &str>(&query,params! {"username" => name, "password" => pwd, "gravatar" => gravatar}).unwrap() {
+    let exec: Result<Vec<Row>, mysql::Error>  = conn.exec(&query,params! {"username" => &name, "password" => &pwd, "gravatar" => &gravatar});
+
+    for row in exec.unwrap() {
         let data = from_row::<Row>(row.clone());
 
         println!("{:?}", data);
@@ -603,6 +607,6 @@ fn rocket() -> _ {
     println!("Started @ {} : {}", conf.address, conf.port);
 
     rocket::custom(&conf)
-        .mount("/", routes![login, logout, register])
+        .mount("/", routes![login, logout, register, getinfo])
         .attach(CORS)
 }
