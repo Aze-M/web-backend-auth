@@ -12,7 +12,7 @@ use std::net::Ipv4Addr;
 use std::path::Path;
 use std::vec;
 
-use mysql::prelude::{Queryable};
+use mysql::prelude::Queryable;
 use mysql::{from_row, params, Row};
 use mysql::{Opts, Pool};
 
@@ -21,6 +21,7 @@ use rand::{thread_rng, Rng};
 
 use rocket::fairing::{Fairing, Info, Kind};
 use rocket::http::{Header, Status};
+use rocket::response::{status};
 use rocket::serde::json::Json;
 use rocket::serde::json::*;
 use rocket::serde::{Deserialize, Serialize};
@@ -149,11 +150,22 @@ fn generate_token(acc: Account, pool: &Pool) -> Option<Token> {
     //insert generated token in to db, remove old tokens for account id.
     let conn = pool.get_conn();
 
+    //keep account name for logging
+    let acc_name = acc.name.clone();
+
     if !purge_tokens(acc, pool) {
+        println!(
+            "Error while generating token, failed @ Purging tokens for {:?}",
+            acc_name
+        );
         return None;
     };
 
     if conn.is_err() {
+        println!(
+            "Error while generating token, failed @ PooledConn {:?}",
+            conn
+        );
         return None;
     }
     //build query to insert token into db
@@ -163,13 +175,17 @@ fn generate_token(acc: Account, pool: &Pool) -> Option<Token> {
         .prep("INSERT INTO sessions ( userid , token ) VALUES ( :userid , :token )")
         .unwrap();
 
-    let ins: Result<Vec<Row>, mysql::Error>  = conn.exec(
+    let ins: Result<Vec<Row>, mysql::Error> = conn.exec(
         &stmt,
         params! {"userid" => &user_token.id.unwrap(), "token" => &user_token.token},
     );
 
     //if it errors return none to trigger error catch
     if ins.is_err() {
+        println!(
+            "Error while generating token, faled @ insert statement {:?}",
+            stmt
+        );
         return None;
     }
 
@@ -186,15 +202,17 @@ fn validate_token(tok: &Token, pool: &Pool) -> bool {
     }
     let mut conn = conn.unwrap();
 
-    let res: Result<Vec<Row>, mysql::Error>  = conn.query::<Row, &str>(&query);
+    let res: Result<Vec<Row>, mysql::Error> = conn.query::<Row, &str>(&query);
 
     if res.is_err() {
+        println!("Could not validate token, failed @ QUERY {:?}", query);
         return false;
     }
 
     let res = res.unwrap();
 
     if res.len() == 0 {
+        println!("Could not validate token, failed @ RESULT {:?}", res);
         return false;
     }
 
@@ -222,7 +240,17 @@ fn find_account(search: AccFetchSettings, pool: &Pool) -> Option<Account> {
     //unsafe , needs reworking
     let query = format!("SELECT * FROM accounts WHERE {} ", options.join(" AND "));
 
-    let mut conn = pool.get_conn().unwrap();
+    let conn = pool.get_conn();
+
+    if conn.is_err() {
+        println!(
+            "Account could not be found, failed @ PooledConn: {:?}",
+            conn
+        );
+        return None;
+    }
+
+    let mut conn = conn.unwrap();
 
     for row in conn.query::<Row, &str>(&query).unwrap() {
         let data = from_row::<Row>(row.clone());
@@ -237,6 +265,7 @@ fn find_account(search: AccFetchSettings, pool: &Pool) -> Option<Account> {
         return Some(acc);
     }
 
+    println!("Account could not be found, sucessfully inserted, invalid parameters by client");
     return None;
 }
 
@@ -245,18 +274,26 @@ fn find_account_id_from_token(search: AccFetchSettings, pool: &Pool) -> Option<i
         return None;
     }
 
-    let mut conn = pool.get_conn().unwrap();
+    let conn = pool.get_conn();
+
+    if conn.is_err() {
+        println!(
+            "Account ID could not be found, failed @ PooledConn: {:?}",
+            conn
+        );
+        return None;
+    }
+
+    let mut conn = conn.unwrap();
 
     let stmt = conn
         .prep("SELECT userid FROM sessions where token = :token")
         .unwrap();
 
-    let exec: Result<Vec<Row>, mysql::Error> = conn
-    .exec(&stmt, params! {"token" => search.token.unwrap().as_str()});
+    let exec: Result<Vec<Row>, mysql::Error> =
+        conn.exec(&stmt, params! {"token" => search.token.unwrap().as_str()});
 
-
-    for row in exec.unwrap()
-    {
+    for row in exec.unwrap() {
         let data = from_row::<Row>(row.clone());
 
         println!("{:?}", data);
@@ -264,15 +301,29 @@ fn find_account_id_from_token(search: AccFetchSettings, pool: &Pool) -> Option<i
         return Some(data.get(0).unwrap());
     }
 
+    println!("Account ID could not be found");
     return None;
 }
 
 fn insert_account(name: String, pwd: String, gravatar: String, pool: &Pool) -> Option<Account> {
-    let mut conn = pool.get_conn().unwrap();
+    let conn = pool.get_conn();
+
+    if conn.is_err() {
+        println!(
+            "Account could not be inserted, failed @ PooledConn: {:?}",
+            conn
+        );
+        return None;
+    }
+
+    let mut conn = conn.unwrap();
 
     let query = conn.prep("INSERT INTO accounts (username,password,gravatar) VALUES (:username,:password,:gravatar)").unwrap();
 
-    let exec: Result<Vec<Row>, mysql::Error>  = conn.exec(&query,params! {"username" => &name, "password" => &pwd, "gravatar" => &gravatar});
+    let exec: Result<Vec<Row>, mysql::Error> = conn.exec(
+        &query,
+        params! {"username" => &name, "password" => &pwd, "gravatar" => &gravatar},
+    );
 
     for row in exec.unwrap() {
         let data = from_row::<Row>(row.clone());
@@ -293,12 +344,13 @@ fn insert_account(name: String, pwd: String, gravatar: String, pool: &Pool) -> O
         return acc;
     }
 
+    println!("Account could not be created.");
     return None;
 }
 
 //Handling logins
 #[post("/auth/login", format = "json", data = "<json>")]
-fn login(json: Json<Value>) -> Result<Json<Token>, Status> {
+fn login<'a>(json: Json<Value>) -> Result<Json<Token>, status::Custom<&'a str>> {
     println!("Recieved login request");
 
     //load config
@@ -306,7 +358,10 @@ fn login(json: Json<Value>) -> Result<Json<Token>, Status> {
 
     //error if the config fails to load
     if config.is_none() {
-        return Err(Status::InternalServerError);
+        return Err(status::Custom(
+            Status::InternalServerError,
+            "Could not load config.",
+        ));
     }
 
     let conf_unw = config.unwrap();
@@ -321,7 +376,10 @@ fn login(json: Json<Value>) -> Result<Json<Token>, Status> {
     if db.is_ok() {
         pool = Pool::new(db.unwrap()).unwrap();
     } else {
-        return Err(Status::InternalServerError);
+        return Err(status::Custom(
+            Status::InternalServerError,
+            "Could not parse database from config.",
+        ));
     }
 
     //define request and reserve for token
@@ -330,7 +388,10 @@ fn login(json: Json<Value>) -> Result<Json<Token>, Status> {
 
     //decline bad requests
     if !incoming_request.contains_key("name") || !incoming_request.contains_key("password") {
-        return Err(Status::BadRequest);
+        return Err(status::Custom(
+            Status::BadRequest,
+            "Request missing name or password",
+        ));
     }
 
     //on good requests, move name and password to variables for ease of use, add arbitration to password
@@ -359,14 +420,20 @@ fn login(json: Json<Value>) -> Result<Json<Token>, Status> {
 
     //if it does not exist return badrequest
     if !acc.is_some() {
-        return Err(Status::BadRequest);
+        return Err(status::Custom(
+            Status::BadRequest,
+            "Account could not be found",
+        ));
     }
 
     //Generate a new token for acc
     user_token = generate_token(acc.unwrap(), &pool);
 
     if user_token.is_none() {
-        return Err(Status::InternalServerError);
+        return Err(status::Custom(
+            Status::InternalServerError,
+            "Error while generating token",
+        ));
     }
 
     let user_token = user_token.unwrap();
@@ -375,12 +442,15 @@ fn login(json: Json<Value>) -> Result<Json<Token>, Status> {
         return Ok(Json::from(user_token));
     }
 
-    return Err(Status::BadRequest);
+    return Err(status::Custom(
+        Status::InternalServerError,
+        "Generated Token could not be validated.",
+    ));
 }
 
 //Handling logouts
 #[post("/auth/logout", format = "json", data = "<json>")]
-fn logout(json: Json<Value>) -> Status {
+fn logout<'a >(json: Json<Value>) -> status::Custom<&'a str> {
     println!("Recieved logout request");
 
     //load config
@@ -388,7 +458,7 @@ fn logout(json: Json<Value>) -> Status {
 
     //error if the config fails to load
     if config.is_none() {
-        return Status::InternalServerError;
+        return status::Custom(Status::InternalServerError, "Could not load config");
     }
 
     let conf_unw = config.unwrap();
@@ -402,7 +472,7 @@ fn logout(json: Json<Value>) -> Status {
     if db.is_ok() {
         pool = Pool::new(db.unwrap()).unwrap();
     } else {
-        return Status::InternalServerError;
+        return status::Custom(Status::InternalServerError, "Could not parse database from config");
     }
 
     let incoming_request = json.as_object().unwrap();
@@ -426,7 +496,7 @@ fn logout(json: Json<Value>) -> Status {
     let affected_account_id = find_account_id_from_token(search, &pool);
 
     if affected_account_id.is_none() {
-        return Status::Unauthorized;
+        return status::Custom(Status::BadRequest, "Account has no active session");
     }
 
     search = AccFetchSettings {
@@ -438,17 +508,17 @@ fn logout(json: Json<Value>) -> Status {
     let affected_account = find_account(search, &pool);
 
     if affected_account.is_none() {
-        return Status::InternalServerError;
+        return status::Custom(Status::InternalServerError, "Token resolved to invalid account ID");
     }
 
     purge_tokens(affected_account.unwrap(), &pool);
 
-    return Status::Ok;
+    return status::Custom(Status::Ok, "Sucessfully logged out.");
 }
 
 //Handling registration
 #[post("/auth/register", format = "json", data = "<json>")]
-fn register(json: Json<Value>) -> Result<Json<Token>, Status> {
+fn register<'a >(json: Json<Value>) -> Result<Json<Token>, status::Custom<&'a str>> {
     println!("Recieved register request");
 
     //load config
@@ -456,7 +526,7 @@ fn register(json: Json<Value>) -> Result<Json<Token>, Status> {
 
     //error if the config fails to load
     if config.is_none() {
-        return Err(Status::InternalServerError);
+        return Err(status::Custom(Status::InternalServerError, "Could not load config."));
     }
 
     let conf_unw = config.unwrap();
@@ -471,13 +541,13 @@ fn register(json: Json<Value>) -> Result<Json<Token>, Status> {
     if db.is_ok() {
         pool = Pool::new(db.unwrap()).unwrap();
     } else {
-        return Err(Status::InternalServerError);
+        return Err(status::Custom(Status::InternalServerError, "Could not parse database from config"));
     }
 
     let incoming_request = json.as_object().unwrap();
 
     if incoming_request.get("username").is_none() || incoming_request.get("password").is_none() {
-        return Err(Status::BadRequest);
+        return Err(status::Custom(Status::BadRequest, "Request missing name or password"));
     }
 
     //redefine for ease of use
@@ -504,13 +574,13 @@ fn register(json: Json<Value>) -> Result<Json<Token>, Status> {
     let account_check = find_account(search, &pool);
 
     if account_check.is_some() {
-        return Err(Status::BadRequest);
+        return Err(status::Custom(Status::BadRequest, "Account with this name already exists"));
     }
 
     let acc = insert_account(name.into(), pwd, gravatar.into(), &pool);
 
     if acc.is_none() {
-        return Err(Status::InternalServerError);
+        return Err(status::Custom(Status::InternalServerError, "Something went wrong while creating the account"));
     }
 
     let acc = acc.unwrap();
@@ -518,7 +588,7 @@ fn register(json: Json<Value>) -> Result<Json<Token>, Status> {
     let initial_token = generate_token(acc, &pool);
 
     if initial_token.is_none() {
-        return Err(Status::InternalServerError);
+        return Err(status::Custom(Status::InternalServerError, "Could not generate initial token."));
     }
 
     return Ok(Json::from(initial_token.unwrap()));
