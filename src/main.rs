@@ -6,6 +6,7 @@
 #[macro_use]
 extern crate rocket;
 
+use std::convert::Infallible;
 use std::fs::File;
 use std::io::Read;
 use std::net::Ipv4Addr;
@@ -19,8 +20,10 @@ use mysql::{Opts, Pool};
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 
+use rocket::data::Outcome;
 use rocket::fairing::{Fairing, Info, Kind};
 use rocket::http::{Header, Status};
+use rocket::request::FromRequest;
 use rocket::response::{status};
 use rocket::serde::json::Json;
 use rocket::serde::json::*;
@@ -78,10 +81,12 @@ struct AccFetchSettings {
     token: Option<String>,
 }
 
-// impl<'a, 'r> FromRequest<'a, 'r> for Token {
+// The documentation for this is out of date and nothing I tried seemed to work.
+
+// impl<'a> FromRequest<'a> for Token {
 //     type Error = Infallible;
 
-//     fn from_request(request: &'a Request<'r>) -> Outcome<Self, Self::Error> {
+//     fn from_request<'r>(request: &'a Request<'_>) -> Outcome<Self, Self::Error> {
 //         let token = request.headers().get_one("Authorization");
 //     }
 // }
@@ -94,7 +99,7 @@ fn load_config() -> Option<Options> {
     let file = File::open(path);
 
     //None if the file fails to load, log to console.
-    if !file.is_ok() {
+    if file.is_err() {
         println!("Could not load file {:?}", display);
         println!("Work dir {:?}", std::env::current_dir());
         return None;
@@ -419,7 +424,7 @@ fn login<'a>(json: Json<Value>) -> Result<Json<Token>, status::Custom<&'a str>> 
     );
 
     //if it does not exist return badrequest
-    if !acc.is_some() {
+    if acc.is_none() {
         return Err(status::Custom(
             Status::BadRequest,
             "Account could not be found",
