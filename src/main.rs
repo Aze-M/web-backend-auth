@@ -94,6 +94,8 @@ struct AccFetchSettings {
 //Config
 fn load_config() -> Option<Options> {
     //Path to config
+
+    //Ideally i'd like this to be a constant but it needs major reworking for that to be feasible.
     let path: &Path = Path::new("./config/config.json");
     let display = path.display();
     let file = File::open(path);
